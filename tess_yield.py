@@ -1,15 +1,19 @@
 from pylab import *
 import pandas as pd
-import analysis as an
 import os
-from tools import blam
 import pdb
-import k2_fits as k2fits
+import ephem
+
+import observing as obs
+import analysis as an
 
 _tessdata = os.path.expanduser('~/docs/papers/contributing/k2_catalog_c0-4/paper/')
 _k2data   = os.path.expanduser('~/proj/mdwarfs/kepler2/catalogs/')
 
 def k2_table(_k2fn=_k2data + 'output28.csv'):
+    import k2fits
+    """Load my K2 planet candidate tables.
+    """
     k2 = pd.read_csv(_k2fn, skipinitialspace=True)
     try:
         candidates = []
@@ -56,6 +60,8 @@ def k2_table(_k2fn=_k2data + 'output28.csv'):
     return k2
 
 def tess_table(_tessfn=_tessdata + 'Sullivan+2015.csv'):
+    """Load the Sullivan et al. TESS simulation and add extra columns.
+    """
     tess = pd.read_csv(_tessfn, skipinitialspace=True, delimiter=',')
     colnames = [col.lower() for col in tess.columns]
     if not 'mstar' in colnames:
@@ -71,6 +77,14 @@ def tess_table(_tessfn=_tessdata + 'Sullivan+2015.csv'):
     tess['transitdepth'] = ((tess.Rplanet * an.rearth) / (tess.Rstar * an.rsun))**2
     tess['T14'] = (tess.P / np.pi) * np.arcsin((tess.Rstar * an.rsun) / (tess.a * an.AU) * np.sqrt((1 - tess.transitdepth**0.5)**2 - 0.5**2))
 
+    coords = []
+    for pair in zip(tess.RA, tess.Dec):
+        coords.append(ephem.Ecliptic(ephem.Equatorial(obs.hms(pair[0], output_string=True), obs.dms(pair[1], output_string=True))))
+    tess['ec_lat'] = [coord.lat*180/np.pi for coord in coords]
+    tess['ec_lon'] = [coord.lon*180/np.pi for coord in coords]
+    
+
+    
     return tess
 
 def atmoparams(planetTable=None, lam=None, MMW=None, mh=None, **k2):
@@ -109,11 +123,17 @@ def atmoparams(planetTable=None, lam=None, MMW=None, mh=None, **k2):
     planetTable['MMW'] = MMW
     planetTable['g_mks'] = an.G * an.mearth/an.rearth**2 * (planetTable.Mplanet / planetTable.Rplanet**2)
     planetTable['H_mks'] = (an.k * planetTable.Teq) / (planetTable.MMW / 6e26 * planetTable.g_mks)
-    planetTable['transmission_amplitude'] = 5 * planetTable.H_mks * (planetTable.Rplanet * an.rearth) / (planetTable.Rstar * an.rsun)**2
+    planetTable['scaleheightarea'] = planetTable.H_mks * (planetTable.Rplanet * an.rearth) / (planetTable.Rstar * an.rsun)**2
+    planetTable['SHA_multiplier'] = 5.
+    planetTable['transmission_amplitude'] = planetTable.SHA_multiplier * planetTable.scaleheightarea
     
     if lam is not None:
         eclipsedepth = []
-        for ii in xrange(len(planetTable)):
+        if hasattr(planetTable, 'index'):
+            ind = planetTable.index
+        else:
+            ind = range(len(planetTable))
+        for ii in ind:
             eclipsedepth.append(blam(planetTable.Teq[ii], lam) / blam(planetTable.Teff[ii], lam) * planetTable.transitdepth[ii])
         planetTable['eclipsedepth'] = eclipsedepth
         
@@ -122,6 +142,8 @@ def atmoparams(planetTable=None, lam=None, MMW=None, mh=None, **k2):
 
 
 def MOST(table):
+    """A crude model of MOST observing for a table of planets.
+    """
     # Compute a 2D map of the CVZ:
     ra0, dec0 = np.linspace(0, 24, 721), np.linspace(-90, 90, 361.)
     raa, decc = np.meshgrid(ra0, dec0)
@@ -158,3 +180,51 @@ def MOST(table):
     table['MOST_sep_from_cvz'] = sep_from_cvz
     
     return table
+
+def estimatePlanetParams(teff, rstar, per, a, rp, redist=0.3, ab=0.2, mrmode='wolfgang2016'):
+    """
+    Given a set of planet parameters, estimate/calculate additional parameters.
+
+        planetparams = estimatePlanetParams(validtic.iloc[ii].Teff, validtic.iloc[ii].rad, \
+                                        thisres.p, thisres.a, thisres.r)
+        ty.atmoparams(planetparams);
+
+    wolfgang2016
+    weiss2016
+
+    TO-DO: use composition models to set minimum allowable mass
+    """
+    teq = teff/np.sqrt(215.1*a/rstar) * (redist * (1. - ab))**0.25
+    if mrmode.lower()=='wolfgang2016':
+        c, gamma, sm1, beta = 2.7, 1.3, 1.9, 0.
+        c, gamma, sm1, beta = 1.6, 1.8, 2.9, 0.
+        mp0 = c*rp**gamma
+        u_mp0 = np.sqrt(sm1**2 + beta*(rp-1))
+        mp = np.random.normal(mp0, u_mp0)
+    if mrmode.lower()=='weiss2016':
+        ind = rp > 1.5
+        mp1 = 3.53* rp**0.60
+        mp2 = (1.65 + 3.69 * rp) * (1.65 + 3.69 * 1.5) * (1.333*3.14*(1.5*6.378e6)**3)/5.97e21  # radius & mass of earth
+        mp = 0. + mp2
+        mp[ind] = mp1[ind]
+        
+    mp[mp<0] = 0.001  # minimum allowable mass
+    res = pd.DataFrame(dict(per=per, Rplanet=rp))
+    res['a']   = a
+    res['Teq'] = teq
+    res['Mplanet']  = mp
+    res['gplanet']  = 9.8*mp/res.Rplanet**2
+    res['Teff'] = teff
+    res['Rstar'] = rstar
+    return res
+
+
+def getTESScoverage(eclat, eclong):
+    """Given an ecliptic lat & lon, estimate duration of TESS observations.  Currently VERY crude.
+    
+    """
+    skycoverages = np.array([(78, 351), (65, 54), (7, 27), (0, 0)])
+    np.abs(eclat)
+    skycoveragebin = (np.abs(eclat) >=skycoverages[:,0]).nonzero()[0][0]
+    duration = skycoverages[skycoveragebin, 1]
+    return duration
